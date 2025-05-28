@@ -1,5 +1,3 @@
-Gpc3 Selectively Suppresses Subcutaneous Adipogenesis via Wnt Signaling in Diet-Induced Obesity
-
 ✍️Author: Yan Li
 
 📧Email: liyan@stu.pku.edu.cn
