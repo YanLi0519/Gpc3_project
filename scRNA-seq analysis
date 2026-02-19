@@ -1,177 +1,674 @@
-#===============================================================================
-#This script is used to analyze scRNA-seq data on Combined -in vitro DFAT vs. SVF 
+# ==============================================================================
+# Title: Single-cell RNA-seq Analysis Pipeline for SVF Cells
+# Project: Depot-specific adipose plasticity under dietary intervention
+# Author: Yan Li, Ph.D. Candidate
+# Institution: Peking University
+# Lab: Carlos Lab
+# Contact: liyan@stu.pku.edu.cn
+# Date: 2025-02
+#
+# Description:
+# This script performs preprocessing, integration, clustering, annotation,
+# differential expression analysis, and pathway enrichment analysis for
+# stromal vascular fraction (SVF) single-cell RNA-seq datasets derived from
+# epididymal (eWAT) and inguinal (iWAT) adipose tissues under different
+# dietary conditions (CD, HFD, Diet Switch).
+#
+# Main analytical components:
+#   1. Data loading and metadata annotation
+#   2. Dataset merging and batch correction (Harmony)
+#   3. Clustering and cell type annotation
+#   4. ASPC subpopulation re-clustering
+#   5. Differential expression analysis (Diet-specific comparisons)
+#   6. Persistent HFD-responsive gene identification
+#   7. Functional enrichment (GO, KEGG, Reactome, GSEA)
+#   8. Expression heatmaps and proportion analysis
+#
+# Software environment:
+#   R version >= 4.2
+#   Seurat v4
+#   Harmony
+#   clusterProfiler
+#   org.Mm.eg.db
+#
+# Notes:
+#   - Gene annotations are based on mouse genome (org.Mm.eg.db).
+#   - Batch effects corrected using Harmony (grouped by Depot and Diet).
+#   - Differential expression filtering threshold:
+#       min.pct = 0.25, logfc.threshold = 0.25, p_val_adj < 0.05
+#
+# ==============================================================================
 
-#Created by Yan Li
-#Issue report on liyan@stu.pku.edu.cn
-#Copyright (c) 2024_CarlosLab@PKU_. All rights reserved.
-#===============================================================================
-library(dplyr)
-library(Seurat)
-library(patchwork)
-library(sctransform)
-library(glmGamPoi)
-library(data.table)
-library(ggplot2)
-library(harmony)
-library(clustree)
-library(SingleR)
-library(celldex)
-library(pheatmap)
-library(RColorBrewer)
-library(MySeuratWrappers)
-library(ggsci)
-library(ggstatsplot)
-library(ggrepel)
-#===============================================================================
-# DFAT&SVF combined analysis - ASPC
-#====================================================================================
-ASPC <- NormalizeData(ASPC) %>% FindVariableFeatures() %>% ScaleData()
-ASPC <- SCTransform(ASPC, method = "glmGamPoi", vars.to.regress = "percent.mt", verbose = FALSE)
-ASPC <- RunPCA(ASPC)
-ASPC <- RunHarmony(ASPC,group.by.vars = "Dataset")
-ASPC <- RunUMAP(ASPC, dims = 1:30, reduction="harmony")
-ASPC <- FindNeighbors(ASPC, dims = 1:30, reduction="harmony")
+rm(list = ls())
+options(stringsAsFactors = FALSE)
 
-ASPC <- FindClusters(ASPC,algorithm = 1,resolution = 0.15, reduction.type = "harmony",verbose = T)
-saveRDS(ASPC, "ASPC_5subtypes.rds")
-#====================================================================================
-Leah_5colors <- c("#ECB0C1","#DD6B7B","#F29A76","#FFDC91FF","#D4D3CA")
-Seurat::DimPlot(ASPC, reduction = "umap", group.by = "seurat_clusters",
-                    pt.size = 0.2, cols = Leah_5colors,
-                    label = T, repel = T, label.box = F, label.size = 7, label.color = "black") +
-  ggtitle("Cluster") + 
-  theme(plot.title = element_text(size = 25), 
-        legend.text = element_text(size = 15))  
+## =========================
+## 0) Paths & libraries
+## =========================
+setwd("/Volumes/Mac's Passport/Project_Gpc3/202312/Merged_12groups")
 
+.libPaths("/Users/yanli/Desktop/Collection/3.PhD_Analysis/renv")
+.libPaths()
 
-ASPC <- RenameIdents(ASPC, `0` = "ASPC1", `1` = "ASPC2", `2` = "ASPC3",`3` = "ASPC4", `4` = "ASPC5")
-ASPC$Subtype <- ASPC@active.ident
-SubtypeRanks <- c("ASPC1", "ASPC2", "ASPC3", "ASPC4", "ASPC5")
-SubtypecolorRanks <-  c("#ECB0C1","#DD6B7B","#F29A76","#FFDC91FF","#D4D3CA")
-Idents(ASPC) <- factor(Idents(ASPC), levels= SubtypeRanks)
-table(ASPC@active.ident)
-saveRDS(ASPC, "ASPC_5subtypes(after_annotation).rds")
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(Seurat)
+  library(patchwork)
+  library(sctransform)
+  library(glmGamPoi)
+  library(data.table)
+  library(ggplot2)
+  library(harmony)
+  library(clustree)
+  library(pheatmap)
+  library(RColorBrewer)
+  library(SeuratWrappers)
+  library(ggsci)
+  library(ggstatsplot)
+  library(ggrepel)
+  library(readxl)
+  library(readr)
+  library(VennDiagram)
+  library(grid)
+  library(gridExtra)   # for grid.arrange
+  library(clusterProfiler)
+  library(org.Mm.eg.db)
+  library(enrichplot)
+})
 
-p = DimPlot(ASPC, reduction = "umap", group.by = "Subtype",
-            pt.size = 0.2, cols = SubtypecolorRanks, label = FALSE) + 
-  ggtitle("ASPC subtypes") +
-  theme(plot.title = element_text(size = 25, hjust = 0.5),  
-        legend.text = element_text(size = 15),
-        legend.position = c(0.88, 0.088),  
-        panel.border = element_rect(linetype = "solid", color = "black", size = 1),
-        legend.box.background = element_blank(),
-        legend.background = element_rect(fill = "transparent"),
-        legend.key = element_rect(fill = "transparent", colour = NULL), 
-        legend.margin = margin(t = 0, r = 0, b = 0, l = 0))
-p
-ggsave("UMAP_ASPC(after_annotation).pdf", p, width = 8.5, height = 8.5)
+Leah_color <- c(
+  "#0072B5FF","#BC3C29FF","#E18727FF","#20854EFF","#6F99ADFF","#7876B1FF",
+  "#EE4C97FF","#FFDC91FF","#3C5488FF","#F39B7FFF","#8491B4FF","#7E6148FF",
+  "#4DBBD5FF","#631879B2","#008B45B2","#BB0021B2","#E64B35FF"
+)
+Depot_color <- c("#02786A","#EB4B17")
+Diet_color <- c("#F39B7FFF","#8491B4FF","#E18727FF","#3C5488FF","#00A087FF")
 
-iWAT_DFAT_cells <- WhichCells(ASPC, expression = Dataset == "iWAT_DFAT")
-p = DimPlot(ASPC, reduction = "umap", group.by = "Subtype", 
-        cells = iWAT_DFAT_cells, 
-        pt.size = 0.5, cols = SubtypecolorRanks, label = FALSE) +
-  ggtitle("ASPC subtypes - iWAT_DFAT") + 
-  theme(plot.title = element_text(size = 25, hjust = 0.5), 
-        legend.text = element_text(size = 15),
-        legend.position = c(0.88, 0.088),  
-        panel.border = element_rect(linetype = "solid", color = "black", size = 1),
-        legend.box.background = element_blank(), 
-        legend.background = element_rect(fill = "transparent"),
-        legend.key = element_rect(fill = "transparent", colour = NULL), 
-        legend.margin = margin(t = 0, r = 0, b = 0, l = 0)) 
-ggsave("UMAP_ASPC-iWAT_DFAT(after_annotation).pdf", p, width = 8.5, height = 8.5)
+## =========================
+## 1) Load objects
+## =========================
+load("~/Desktop/Desktop_0/0.Data_Analysis/1.SVF_scRNA_seq/Datasets_after_QC(Include introns = False)/Epi_SVF_12CD_sc_after_QC.RData")
+load("~/Desktop/Desktop_0/0.Data_Analysis/1.SVF_scRNA_seq/Datasets_after_QC(Include introns = False)/Epi_SVF_12HFD_sc_after_QC.RData")
+load("~/Desktop/Desktop_0/0.Data_Analysis/1.SVF_scRNA_seq/Datasets_after_QC(Include introns = False)/Epi_SVF_18CD_1_sc_after_QC.RData")
+load("~/Desktop/Desktop_0/0.Data_Analysis/1.SVF_scRNA_seq/Datasets_after_QC(Include introns = False)/Epi_SVF_18CD_2_sc_after_QC.RData")
+load("~/Desktop/Desktop_0/0.Data_Analysis/1.SVF_scRNA_seq/Datasets_after_QC(Include introns = False)/Epi_SVF_18HFD_sc_after_QC.RData")
+load("~/Desktop/Desktop_0/0.Data_Analysis/1.SVF_scRNA_seq/Datasets_after_QC(Include introns = False)/Epi_SVF_Switch_sc_after_QC.RData")
 
-iWAT_SVF_cells <- WhichCells(ASPC, expression = Dataset == "iWAT_SVF")
-p = DimPlot(ASPC, reduction = "umap", group.by = "Subtype", 
-            cells = iWAT_SVF_cells, 
-            pt.size = 0.5, cols = SubtypecolorRanks, label = FALSE) +
-  ggtitle("ASPC subtypes - iWAT_SVF") + 
-  theme(plot.title = element_text(size = 25, hjust = 0.5), 
-        legend.text = element_text(size = 15),
-        legend.position = c(0.88, 0.088), 
-        panel.border = element_rect(linetype = "solid", color = "black", size = 1),
-        legend.box.background = element_blank(), 
-        legend.background = element_rect(fill = "transparent"),
-        legend.key = element_rect(fill = "transparent", colour = NULL), 
-        legend.margin = margin(t = 0, r = 0, b = 0, l = 0))
-ggsave("UMAP_ASPC-iWAT_SVF(after_annotation).pdf", p, width = 8.5, height = 8.5)
+load("~/Desktop/Desktop_0/0.Data_Analysis/1.SVF_scRNA_seq/Datasets_after_QC(Include introns = False)/Ing_SVF_12CD_sc_after_QC.RData")
+load("~/Desktop/Desktop_0/0.Data_Analysis/1.SVF_scRNA_seq/Datasets_after_QC(Include introns = False)/Ing_SVF_12HFD_sc_after_QC.RData")
+load("~/Desktop/Desktop_0/0.Data_Analysis/1.SVF_scRNA_seq/Datasets_after_QC(Include introns = False)/Ing_SVF_18CD_1_sc_after_QC.RData")
+load("~/Desktop/Desktop_0/0.Data_Analysis/1.SVF_scRNA_seq/Datasets_after_QC(Include introns = False)/Ing_SVF_18CD_2_sc_after_QC.RData")
+load("~/Desktop/Desktop_0/0.Data_Analysis/1.SVF_scRNA_seq/Datasets_after_QC(Include introns = False)/Ing_SVF_18HFD_sc_after_QC.RData")
+load("~/Desktop/Desktop_0/0.Data_Analysis/1.SVF_scRNA_seq/Datasets_after_QC(Include introns = False)/Ing_SVF_Switch_sc_after_QC.RData")
 
-eWAT_DFAT_cells <- WhichCells(ASPC, expression = Dataset == "eWAT_DFAT")
-p = DimPlot(ASPC, reduction = "umap", group.by = "Subtype", 
-            cells = eWAT_DFAT_cells,
-            pt.size = 0.5, cols = SubtypecolorRanks, label = FALSE) +
-  ggtitle("ASPC subtypes - eWAT_DFAT") + 
-  theme(plot.title = element_text(size = 25, hjust = 0.5),  
-        legend.text = element_text(size = 15),
-        legend.position = c(0.88, 0.088),  
-        panel.border = element_rect(linetype = "solid", color = "black", size = 1),
-        legend.box.background = element_blank(), 
-        legend.background = element_rect(fill = "transparent"),
-        legend.key = element_rect(fill = "transparent", colour = NULL),
-        legend.margin = margin(t = 0, r = 0, b = 0, l = 0)) 
-ggsave("UMAP_ASPC-eWAT_DFAT(after_annotation).pdf", p, width = 8.5, height = 8.5)
+## =========================
+## 2) Helper functions
+## =========================
+prefix_cells <- function(obj, prefix) {
+  RenameCells(obj, new.names = paste0(prefix, "_", colnames(obj)))
+}
 
-eWAT_SVF_cells <- WhichCells(ASPC, expression = Dataset == "eWAT_SVF")
-p = DimPlot(ASPC, reduction = "umap", group.by = "Subtype", 
-            cells = eWAT_SVF_cells, 
-            pt.size = 0.5, cols = SubtypecolorRanks, label = FALSE) +
-  ggtitle("ASPC subtypes - eWAT_SVF") + 
-  theme(plot.title = element_text(size = 25, hjust = 0.5),  
-        legend.text = element_text(size = 15),
-        legend.position = c(0.88, 0.088),  
-        panel.border = element_rect(linetype = "solid", color = "black", size = 1),
-        legend.box.background = element_blank(), 
-        legend.background = element_rect(fill = "transparent"),
-        legend.key = element_rect(fill = "transparent", colour = NULL), 
-        legend.margin = margin(t = 0, r = 0, b = 0, l = 0))
-ggsave("UMAP_ASPC-eWAT_SVF(after_annotation).pdf", p, width = 8.5, height = 8.5)
-#====================================================================================
-ASPC_Dataset_subtype_Cellnum <- as.data.frame(table(ASPC@active.ident,ASPC$Dataset))
-colnames(ASPC_Dataset_subtype_Cellnum) <- c("Subtype","Dataset","Cell_number")
-ASPC_Dataset_subtype_Cellnum$Dataset <- factor(ASPC_Dataset_subtype_Cellnum$Dataset)
+add_meta <- function(obj, dataset, diet, depot) {
+  obj$Dataset <- dataset
+  obj$Diet <- diet
+  obj$Depot <- depot
+  obj
+}
 
-ASPC_Dataset_subtype_Fraction<- ASPC_Dataset_subtype_Cellnum %>% 
-  dplyr::group_by (Dataset) %>% 
-  dplyr::mutate(Fraction = round(Cell_number/sum(Cell_number),4))
-
-# 转换Fraction为百分比
-ASPC_Dataset_subtype_Fraction <- ASPC_Dataset_subtype_Fraction %>%
-  mutate(Percentage = Fraction * 100) 
-write.csv(ASPC_Dataset_subtype_Fraction, file = "ASPC_Dataset_subtype_Fraction.csv")
-
-
-iWAT_DFAT_data <- ASPC_Dataset_subtype_Fraction %>%
-  filter(Dataset == "iWAT_DFAT")
-p = ggplot(iWAT_DFAT_data , aes(x=Dataset, y=Percentage, fill=Subtype)) + 
-  geom_bar(stat="identity", position="stack", color="black", size=1) + 
-  scale_y_continuous(expand = expansion(add = c(0, 0)), limits = c(0, 120), breaks=seq(0, 120, by=20)) +
-  scale_x_discrete(expand = expansion(add = c(0.5, 0.5))) + 
-  scale_fill_manual(values=Leah_5colors) + 
-  theme_minimal() +
+theme_umap_clean <- function() {
   theme(
-    panel.grid.major = element_blank(), 
-    panel.grid.minor = element_blank(), 
-    axis.text.x = element_blank(), 
+    axis.text.y = element_blank(),
+    axis.ticks.y = element_blank(),
+    axis.text.x = element_blank(),
     axis.ticks.x = element_blank(),
-    axis.title.x = element_blank(), 
-    axis.line = element_line(colour = "black", size = 1), 
-    plot.title = element_text(hjust = 0.5), 
-    legend.position = "none", 
-    axis.ticks = element_line(size = 1) 
-  ) +
-  labs(y = "Proportion (%)", x = "") + 
-  ggtitle("iWAT_DFAT") 
-ggsave("Proportion-iWAT_DFAT.pdf", p, width = 2, height = 6)
-#====================================================================================
-Subtype_markers <- FindAllMarkers(ASPC, assay = "RNA", min.pct = 0.25, logfc.threshold = 0.25) %>% filter(p_val_adj < 0.05)
-Subtype_markers <- Subtype_markers %>% mutate(pct_diff = abs(pct.1 - pct.2))
-write.csv(Subtype_markers, file = "ASPC_Subtype_markers.csv") 
+    axis.line = element_blank()
+  )
+}
 
-p = FeaturePlot(ASPC, "Pdgfra",cols = c("lightgrey", "#C8161D"), 
-                keep.scale = "feature",
-                pt.size = 0.7,label = F,label.size = 7) + 
-  theme(plot.title = element_text(size = 25),  
-        legend.text = element_text(size = 15),
-        panel.border = element_rect(linetype = "solid", colour = "black", size = 1)) 
-p
-ggsave(paste0("FeaturePlot_Pdgfra.pdf"), p, width = 7.8, height = 7)
+## =========================
+## 3) Rename cells + add metadata
+## =========================
+Epi_SVF_12CD_sc    <- prefix_cells(Epi_SVF_12CD_sc,    "Epi_SVF_12CD_sc")
+Epi_SVF_12HFD_sc   <- prefix_cells(Epi_SVF_12HFD_sc,   "Epi_SVF_12HFD_sc")
+Epi_SVF_18CD_1_sc  <- prefix_cells(Epi_SVF_18CD_1_sc,  "Epi_SVF_18CD_1_sc")
+Epi_SVF_18CD_2_sc  <- prefix_cells(Epi_SVF_18CD_2_sc,  "Epi_SVF_18CD_2_sc")
+Epi_SVF_18HFD_sc   <- prefix_cells(Epi_SVF_18HFD_sc,   "Epi_SVF_18HFD_sc")
+Epi_SVF_Switch_sc  <- prefix_cells(Epi_SVF_Switch_sc,  "Epi_SVF_Switch_sc")
+
+Ing_SVF_12CD_sc    <- prefix_cells(Ing_SVF_12CD_sc,    "Ing_SVF_12CD_sc")
+Ing_SVF_12HFD_sc   <- prefix_cells(Ing_SVF_12HFD_sc,   "Ing_SVF_12HFD_sc")
+Ing_SVF_18CD_1_sc  <- prefix_cells(Ing_SVF_18CD_1_sc,  "Ing_SVF_18CD_1_sc")
+Ing_SVF_18CD_2_sc  <- prefix_cells(Ing_SVF_18CD_2_sc,  "Ing_SVF_18CD_2_sc")
+Ing_SVF_18HFD_sc   <- prefix_cells(Ing_SVF_18HFD_sc,   "Ing_SVF_18HFD_sc")
+Ing_SVF_Switch_sc  <- prefix_cells(Ing_SVF_Switch_sc,  "Ing_SVF_Switch_sc")
+
+Epi_SVF_12CD_sc    <- add_meta(Epi_SVF_12CD_sc,   "Epi_SVF_12CD_sc",   "12-week-CD",  "eWAT")
+Epi_SVF_12HFD_sc   <- add_meta(Epi_SVF_12HFD_sc,  "Epi_SVF_12HFD_sc",  "12-week-HFD", "eWAT")
+Epi_SVF_18CD_1_sc  <- add_meta(Epi_SVF_18CD_1_sc, "Epi_SVF_18CD_1_sc", "18-week-CD",  "eWAT")
+Epi_SVF_18CD_2_sc  <- add_meta(Epi_SVF_18CD_2_sc, "Epi_SVF_18CD_2_sc", "18-week-CD",  "eWAT")
+Epi_SVF_18HFD_sc   <- add_meta(Epi_SVF_18HFD_sc,  "Epi_SVF_18HFD_sc",  "18-week-HFD", "eWAT")
+Epi_SVF_Switch_sc  <- add_meta(Epi_SVF_Switch_sc, "Epi_SVF_Switch_sc", "Diet_Switch",  "eWAT")
+
+Ing_SVF_12CD_sc    <- add_meta(Ing_SVF_12CD_sc,   "Ing_SVF_12CD_sc",   "12-week-CD",  "iWAT")
+Ing_SVF_12HFD_sc   <- add_meta(Ing_SVF_12HFD_sc,  "Ing_SVF_12HFD_sc",  "12-week-HFD", "iWAT")
+Ing_SVF_18CD_1_sc  <- add_meta(Ing_SVF_18CD_1_sc, "Ing_SVF_18CD_1_sc", "18-week-CD",  "iWAT")
+Ing_SVF_18CD_2_sc  <- add_meta(Ing_SVF_18CD_2_sc, "Ing_SVF_18CD_2_sc", "18-week-CD",  "iWAT")
+Ing_SVF_18HFD_sc   <- add_meta(Ing_SVF_18HFD_sc,  "Ing_SVF_18HFD_sc",  "18-week-HFD", "iWAT")
+Ing_SVF_Switch_sc  <- add_meta(Ing_SVF_Switch_sc, "Ing_SVF_Switch_sc", "Diet_Switch",  "iWAT")
+
+## =========================
+## 4) Merge 12 groups
+## =========================
+Merged_12groups <- merge(
+  Epi_SVF_12CD_sc,
+  y = list(
+    Epi_SVF_12HFD_sc, Epi_SVF_18CD_1_sc, Epi_SVF_18CD_2_sc, Epi_SVF_18HFD_sc, Epi_SVF_Switch_sc,
+    Ing_SVF_12CD_sc, Ing_SVF_12HFD_sc, Ing_SVF_18CD_1_sc, Ing_SVF_18CD_2_sc, Ing_SVF_18HFD_sc, Ing_SVF_Switch_sc
+  )
+)
+save(Merged_12groups, file = "Merged_12groups_after_merged.RData")
+
+## =========================
+## 5) Preprocess + Harmony
+## =========================
+Merged_12groups <- NormalizeData(Merged_12groups) %>%
+  FindVariableFeatures() %>%
+  ScaleData() %>%
+  RunPCA()
+
+Merged_12groups <- RunHarmony(Merged_12groups, group.by.vars = c("Depot", "Diet"))
+
+# pick dims (you used 1:25)
+Merged_12groups <- RunUMAP(Merged_12groups, dims = 1:25, reduction = "harmony")
+Merged_12groups <- FindNeighbors(Merged_12groups, dims = 1:25, reduction = "harmony")
+
+# clustree scan
+Merged_12groups.test <- FindClusters(
+  Merged_12groups,
+  resolution = seq(0, 0.5, 0.05),
+  reduction.type = "harmony",
+  algorithm = 1,
+  verbose = TRUE
+)
+p_clustree <- clustree(Merged_12groups.test@meta.data, prefix = "RNA_snn_res.")
+ggsave("Merged_12groups_Clustree.pdf", p_clustree, width = 8, height = 8)
+
+Merged_12groups <- FindClusters(
+  Merged_12groups,
+  algorithm = 1,
+  resolution = 0.5,
+  reduction.type = "harmony",
+  verbose = TRUE
+)
+save(Merged_12groups, file = "Merged_12groups_re0.5_27clusters.RData")
+
+## =========================
+## 6) UMAP plots (before annotation)
+## =========================
+p_all <- DimPlot(
+  Merged_12groups, reduction = "umap", pt.size = 0.3,
+  label = TRUE, repel = TRUE, label.size = 7, label.color = "black"
+) + NoLegend() + labs(x = "", y = "") + theme_umap_clean()
+ggsave("Merged_12groups_UMAP_all_cell_types(before_annotation).pdf", p_all, width = 8.5, height = 8)
+
+p_depot <- DimPlot(
+  Merged_12groups, reduction = "umap", pt.size = 0.5,
+  group.by = "Depot", cols = c("#EB4B17", "#02786A")
+) + labs(x = "", y = "") + theme_umap_clean() +
+  theme(legend.text = element_text(size = 20))
+ggsave("Merged_12groups_UMAP_group_by_Depot.pdf", p_depot, width = 8.5, height = 8)
+
+p_diet <- DimPlot(
+  Merged_12groups, reduction = "umap", pt.size = 0.5,
+  group.by = "Diet", cols = Diet_color
+) + labs(x = "", y = "") + theme_umap_clean() +
+  theme(legend.text = element_text(size = 20))
+ggsave("Merged_12groups_UMAP_group_by_Diet(before_annotation).pdf", p_diet, width = 11, height = 8)
+
+## =========================
+## 7) QC / marker violin plots (optional)
+## =========================
+feats_QC <- c("nFeature_RNA","nCount_RNA","percent.mt")
+feats_Rosen_related <- c("Adipoq","Pdgfra","Msln","Jam2","Prox1",
+                         "Step4","Myocd","Mafb","Cy6b","Flt3",
+                         "Cpa3","Csf3r","Ms4a1","Klrd1","Il7r",
+                         "Dcdc2a","Erbb4","Pecam1")
+
+p_vln_qc <- VlnPlot(Merged_12groups, feats_QC, stacked = TRUE, pt.size = 0, x.lab = "", y.lab = "") +
+  theme(axis.text.x = element_text(size = 10), axis.text.y = element_text(size = 10))
+ggsave("Merged_12groups_VlnPlot_feats_QC(before_annotation).pdf", p_vln_qc, width = 8, height = 12)
+
+p_vln_rosen <- VlnPlot(Merged_12groups, feats_Rosen_related, stacked = TRUE, pt.size = 0, x.lab = "", y.lab = "") +
+  theme(axis.text.x = element_text(size = 10), axis.text.y = element_text(size = 10))
+ggsave("Merged_12groups_VlnPlot_Rosen_related(before_annotation).pdf", p_vln_rosen, width = 8, height = 12)
+
+## =========================
+## 8) Cluster markers (before annotation)
+## =========================
+Cluster_markers <- FindAllMarkers(
+  Merged_12groups, only.pos = TRUE, assay = "RNA",
+  min.pct = 0.25, logfc.threshold = 0.25
+) %>% filter(p_val_adj < 0.05)
+
+Cluster_markers <- setorderv(
+  as.data.table(Cluster_markers),
+  c("cluster","avg_log2FC","pct.1","pct.2"),
+  c(1,-1,1,-1)
+)
+fwrite(Cluster_markers, "Merged_12groups_Cluster_markers.csv")
+
+## =========================
+## 9) Manual annotation (cell type)
+## =========================
+# IMPORTANT: keep your mapping as-is
+Merged_12groups <- RenameIdents(Merged_12groups,
+                                `0`="ASPC", `1`="B cell", `2`="T cell", `3`="Macrophage",
+                                `4`="T cell", `5`="T cell", `6`="ASPC",
+                                `7`="ASPC", `8`="Macrophage", `9`="T cell",
+                                `10`="NK cell", `11`="Dendritic", `12`="Dendritic",
+                                `13`="Mast cell", `14`="Macrophage", `15`="Neutrophil",
+                                `16`="T cell", `17`="Dendritic", `18`="B cell",
+                                `19`="ASPC", `20`="Endothelial", `21`="Neutrophil",
+                                `22`="Pericyte", `23`="Mesothelial", `24`="Lymphaticendo",
+                                `25`="ASPC", `26`="Mast cell"
+)
+Merged_12groups$Cell_Type <- Idents(Merged_12groups)
+
+celltypeRanks <- c("ASPC","Endothelial","Mesothelial","Lymphaticendo","Pericyte",
+                   "Macrophage","T cell","B cell","NK cell","Dendritic","Mast cell","Neutrophil")
+cellcolorRanks <- c("#206864","#81475C","#995D7F","#FFFBC7","#88BFB8",
+                    "#D12920","#C35C6A","#CD7372","#EFC4CE","#C6A268","#BC6E37","#ED6D3D")
+Idents(Merged_12groups) <- factor(Idents(Merged_12groups), levels = celltypeRanks)
+
+save(Merged_12groups, file = "Merged_12groups_after_annotation.RData")
+
+p_anno <- DimPlot(
+  Merged_12groups, reduction="umap", pt.size=0.3, cols=cellcolorRanks,
+  label=TRUE, repel=TRUE, label.size=7, label.color="black"
+) + NoLegend() + labs(x="", y="") + theme_umap_clean()
+ggsave("Merged_12groups_UMAP_all_cell_types(after_annotation).pdf", p_anno, width=8.5, height=8)
+
+Cell_Type_markers <- FindAllMarkers(
+  Merged_12groups, only.pos = TRUE, assay = "RNA",
+  min.pct = 0.25, logfc.threshold = 0.25
+) %>% filter(p_val_adj < 0.05)
+Cell_Type_markers <- setorderv(
+  as.data.table(Cell_Type_markers),
+  c("cluster","avg_log2FC","pct.1","pct.2"),
+  c(1,-1,1,-1)
+)
+fwrite(Cell_Type_markers, "Merged_12groups_Cell_Type_markers.csv")
+
+## =========================
+## 10) Subset ASPC pool
+## =========================
+Merged_12groups_ASPC <- subset(Merged_12groups, idents = "ASPC")
+save(Merged_12groups_ASPC, file = "Merged_12groups_ASPC.RData")
+
+## =========================
+## 11) FeaturePlot (no Gpc3 0/1 binning)
+## =========================
+p_gpc3 <- FeaturePlot(
+  Merged_12groups, features = "Gpc3",
+  cols = c("lightgrey","blue","seagreen2"),
+  keep.scale = "feature", pt.size = 0.1
+) + labs(x="", y="") + theme_umap_clean()
+ggsave("Merged_12groups_FeaturePlot_Gpc3.pdf", p_gpc3, width=8.5, height=8)
+
+p_pdgfra <- FeaturePlot(
+  Merged_12groups, features = "Pdgfra",
+  cols = c("lightgrey","#623AA2","#F97794"),
+  keep.scale = "feature", pt.size = 0.1
+) + labs(x="", y="") + theme_umap_clean()
+ggsave("Merged_12groups_FeaturePlot_Pdgfra.pdf", p_pdgfra, width=8.5, height=8)
+
+## =============================================================================
+## PART B: ASPC recluster
+## =============================================================================
+setwd("/Volumes/Leah_Projs/单细胞测序分析/scRNA_seq_SVF_cells/ASPC_recluster_1")
+
+# 你原代码这里写的是 Merged_10groups_ASPC + ASPC1/2；我按合理版本改成：
+# - 从 Merged_12groups_ASPC 再做一次 clustering 得到 ASPC 子群
+# - 如果你已有 “New_ASPC_after_anno.rds”，直接读取也可以
+
+New_ASPC <- Merged_12groups_ASPC
+New_ASPC <- NormalizeData(New_ASPC) %>% FindVariableFeatures() %>% ScaleData() %>% RunPCA()
+New_ASPC <- RunHarmony(New_ASPC, group.by.vars = c("Diet","Depot"))
+
+New_ASPC <- RunUMAP(New_ASPC, dims = 1:12, reduction = "harmony")
+New_ASPC <- FindNeighbors(New_ASPC, dims = 1:12, reduction = "harmony")
+
+New_ASPC.test <- FindClusters(
+  New_ASPC,
+  resolution = seq(0, 0.2, 0.02),
+  reduction.type = "harmony",
+  algorithm = 1,
+  verbose = TRUE
+)
+p_clustree_aspc <- clustree(New_ASPC.test@meta.data, prefix = "RNA_snn_res.")
+ggsave("New_ASPC_Clustree.pdf", p_clustree_aspc, width = 8, height = 10)
+
+New_ASPC <- FindClusters(New_ASPC, algorithm = 1, resolution = 0.04, reduction.type = "harmony", verbose = TRUE)
+saveRDS(New_ASPC, "New_ASPC_re0.04_rawclusters.rds")
+
+# 手动命名（示例：0/1/2 -> ASPC1/ASPC2/ASPC3）
+New_ASPC <- RenameIdents(New_ASPC, `0`="ASPC1", `1`="ASPC2", `2`="ASPC3")
+New_ASPC$Subpopulation <- Idents(New_ASPC)
+Idents(New_ASPC) <- "Subpopulation"
+saveRDS(New_ASPC, "New_ASPC_after_anno.rds")
+
+p_aspc_umap <- DimPlot(
+  New_ASPC, reduction="umap", pt.size=0.5, cols=Leah_color,
+  label=TRUE, repel=TRUE, label.size=5, label.color="black"
+) + labs(x="", y="") + theme_umap_clean()
+ggsave("New_ASPC_UMAP_all_subpopulations.pdf", p_aspc_umap, width=8.5, height=8)
+
+p_aspc_feat <- FeaturePlot(
+  New_ASPC, features=c("Pdgfra","Pdgfrb","Dpp4","Icam1"),
+  ncol=2, cols=c("lightgrey","blue"),
+  keep.scale="feature", pt.size=0.3
+)
+ggsave("FeaturePlot_New_ASPC.pdf", p_aspc_feat, width=8.5, height=8)
+
+ASPC_subpopulation_markers <- FindAllMarkers(
+  New_ASPC, only.pos = TRUE, assay = "RNA",
+  min.pct = 0.25, logfc.threshold = 0.25
+) %>% filter(p_val_adj < 0.05)
+ASPC_subpopulation_markers <- setorderv(
+  as.data.table(ASPC_subpopulation_markers),
+  c("cluster","avg_log2FC","pct.1","pct.2"),
+  c(1,-1,1,-1)
+)
+fwrite(ASPC_subpopulation_markers, "New_ASPC_subpopulation_markers.csv")
+
+## =============================================================================
+## PART C: iWAT vs eWAT ASPC analysis
+## =============================================================================
+Ing_ASPC <- subset(New_ASPC, subset = Depot == "iWAT")
+saveRDS(Ing_ASPC, "Ing_ASPC.rds")
+
+Epi_ASPC <- subset(New_ASPC, subset = Depot == "eWAT")
+saveRDS(Epi_ASPC, "Epi_ASPC.rds")
+
+# (No Gpc3 0/1 picking) - just visualize continuous expression
+ggsave("Ing_ASPC_FeaturePlot_Gpc3.pdf",
+       FeaturePlot(Ing_ASPC, features="Gpc3", cols=c("lightgrey","blue"), pt.size=1) + theme_umap_clean(),
+       width=8.5, height=8)
+
+ggsave("Epi_ASPC_FeaturePlot_Gpc3.pdf",
+       FeaturePlot(Epi_ASPC, features="Gpc3", cols=c("lightgrey","blue"), pt.size=1) + theme_umap_clean(),
+       width=8.5, height=8)
+
+p_ing_split <- DimPlot(
+  Ing_ASPC, reduction="umap", pt.size=0.5, split.by="Diet", cols=Leah_color,
+  label=TRUE, repel=TRUE, label.size=3, label.color="black"
+) + theme_umap_clean() +
+  theme(panel.border = element_rect(fill=NA, color="black", size=1),
+        plot.title = element_text(size=22),
+        legend.text = element_text(size=12))
+ggsave("Ing_ASPC_UMAP_split(Diet).pdf", p_ing_split, device="pdf", width=18, height=4)
+
+p_epi_split <- DimPlot(
+  Epi_ASPC, reduction="umap", pt.size=0.5, split.by="Diet", cols=Leah_color,
+  label=TRUE, repel=TRUE, label.size=3, label.color="black"
+) + theme_umap_clean() +
+  theme(panel.border = element_rect(fill=NA, color="black", size=1),
+        plot.title = element_text(size=22),
+        legend.text = element_text(size=12))
+ggsave("Epi_ASPC_UMAP_split(Diet).pdf", p_epi_split, device="pdf", width=18, height=4)
+
+## =========================
+## 12) Diet fractions in iWAT/eWAT ASPC (pie + bar)
+## =========================
+calc_cluster_fraction <- function(obj, group_var = "Diet") {
+  df <- as.data.frame(table(Idents(obj), obj[[group_var]][,1]))
+  colnames(df) <- c("Cell_type", group_var, "Cell_number")
+  df %>%
+    group_by(.data[[group_var]]) %>%
+    mutate(Fraction = round(Cell_number / sum(Cell_number), 4)) %>%
+    ungroup()
+}
+
+plot_pies_by_group <- function(df, group_var = "Diet", colors = Leah_color, out = "combined_pies.png") {
+  groups <- unique(df[[group_var]])
+  plots <- list()
+  for (i in seq_along(groups)) {
+    g <- groups[i]
+    sub <- dplyr::filter(df, .data[[group_var]] == g)
+    p <- ggplot(sub, aes(x=1, y=Fraction, fill=Cell_type)) +
+      geom_bar(stat="identity", width=1, show.legend = (i == length(groups))) +
+      coord_polar("y", start=0) +
+      theme_void() +
+      labs(title=g) +
+      theme(plot.title = element_text(hjust=0.5),
+            legend.position="bottom",
+            legend.box="vertical",
+            legend.direction="vertical")
+    # colors: if you have exactly k cell types and want fixed mapping, set scale_fill_manual.
+    plots[[g]] <- p
+  }
+  combined <- do.call(grid.arrange, c(plots, ncol = length(groups)))
+  ggsave(out, plot = combined, width = 20, height = 5)
+  combined
+}
+
+Ing_frac <- calc_cluster_fraction(Ing_ASPC, "Diet")
+write.csv(Ing_frac, "Ing_ASPC_Diet_cluster_Fraction.csv", row.names = FALSE)
+plot_pies_by_group(Ing_frac, "Diet", out = "Ing_ASPC_combined_pie_charts.png")
+
+Epi_frac <- calc_cluster_fraction(Epi_ASPC, "Diet")
+write.csv(Epi_frac, "Epi_ASPC_Diet_cluster_Fraction.csv", row.names = FALSE)
+plot_pies_by_group(Epi_frac, "Diet", out = "Epi_ASPC_combined_pie_charts.png")
+
+## =========================
+## 13) DEGs: HFD vs CD (iWAT & eWAT)
+## =========================
+run_deg <- function(obj, ident1, ident2, out_csv) {
+  Idents(obj) <- obj$Diet
+  deg <- FindMarkers(obj, ident.1 = ident1, ident.2 = ident2,
+                     assay="RNA", min.pct=0.25, logfc.threshold=0.25) %>%
+    as.data.frame() %>%
+    dplyr::filter(p_val_adj < 0.05) %>%
+    tibble::rownames_to_column("gene") %>%
+    mutate(Change = ifelse(avg_log2FC > 0, "up", "down"))
+  deg <- setorderv(as.data.table(deg), c("avg_log2FC","pct.1","pct.2"), c(-1,1,-1))
+  fwrite(deg, out_csv)
+  as.data.frame(deg)
+}
+
+## iWAT
+Diet_markers_iWAT_HFD12_vsCD12 <- run_deg(Ing_ASPC, "12-week-HFD", "12-week-CD", "Ing_ASPC_Diet_markers_HFD12_vsCD12.csv")
+Diet_markers_iWAT_HFD18_vsCD18 <- run_deg(Ing_ASPC, "18-week-HFD", "18-week-CD", "Ing_ASPC_Diet_markers_HFD18_vsCD18.csv")
+
+## eWAT
+Diet_markers_eWAT_HFD12_vsCD12 <- run_deg(Epi_ASPC, "12-week-HFD", "12-week-CD", "Epi_ASPC_Diet_markers_HFD12_vsCD12.csv")
+Diet_markers_eWAT_HFD18_vsCD18 <- run_deg(Epi_ASPC, "18-week-HFD", "18-week-CD", "Epi_ASPC_Diet_markers_HFD18_vsCD18.csv")
+
+## persistent genes
+get_persistent <- function(deg12, deg18, out_up, out_down) {
+  up12 <- subset(deg12, Change == "up")$gene
+  dn12 <- subset(deg12, Change == "down")$gene
+  up18 <- subset(deg18, Change == "up")$gene
+  dn18 <- subset(deg18, Change == "down")$gene
+  
+  up_p <- data.frame(gene = intersect(up12, up18))
+  dn_p <- data.frame(gene = intersect(dn12, dn18))
+  write.csv(up_p, out_up, row.names = FALSE)
+  write.csv(dn_p, out_down, row.names = FALSE)
+  list(up = up_p, down = dn_p)
+}
+
+Ing_persist <- get_persistent(
+  Diet_markers_iWAT_HFD12_vsCD12, Diet_markers_iWAT_HFD18_vsCD18,
+  "Ing_ASPC_persistent_HFD_responsive_gene_up.csv",
+  "Ing_ASPC_persistent_HFD_responsive_gene_down.csv"
+)
+
+Epi_persist <- get_persistent(
+  Diet_markers_eWAT_HFD12_vsCD12, Diet_markers_eWAT_HFD18_vsCD18,
+  "Epi_ASPC_persistent_HFD_responsive_gene_up.csv",
+  "Epi_ASPC_persistent_HFD_responsive_gene_down.csv"
+)
+
+## =========================
+## 14) Venn diagrams
+## =========================
+draw_venn_pair <- function(a1, a2, cross, category, out_pdf, fill=c("#6DADD1","#104680")) {
+  vp <- draw.pairwise.venn(
+    area1 = a1, area2 = a2, cross.area = cross,
+    category = category,
+    fill = fill, alpha = 0.6, cat.pos = c(0,180),
+    cat.cex = 1.5, cex = 2, fontface = "bold",
+    lwd = 2, col = "black"
+  )
+  pdf(out_pdf, width = 6.2, height = 6)
+  grid.draw(vp)
+  dev.off()
+}
+
+# iWAT
+draw_venn_pair(
+  a1 = nrow(subset(Diet_markers_iWAT_HFD12_vsCD12, Change=="up")),
+  a2 = nrow(subset(Diet_markers_iWAT_HFD18_vsCD18, Change=="up")),
+  cross = nrow(Ing_persist$up),
+  category = c("iWAT_12HFD_up","iWAT_18HFD_up"),
+  out_pdf = "VennDiagram_iWAT_up.pdf"
+)
+draw_venn_pair(
+  a1 = nrow(subset(Diet_markers_iWAT_HFD12_vsCD12, Change=="down")),
+  a2 = nrow(subset(Diet_markers_iWAT_HFD18_vsCD18, Change=="down")),
+  cross = nrow(Ing_persist$down),
+  category = c("iWAT_12HFD_down","iWAT_18HFD_down"),
+  out_pdf = "VennDiagram_iWAT_down.pdf"
+)
+
+# eWAT
+draw_venn_pair(
+  a1 = nrow(subset(Diet_markers_eWAT_HFD12_vsCD12, Change=="up")),
+  a2 = nrow(subset(Diet_markers_eWAT_HFD18_vsCD18, Change=="up")),
+  cross = nrow(Epi_persist$up),
+  category = c("eWAT_12HFD_up","eWAT_18HFD_up"),
+  out_pdf = "VennDiagram_eWAT_up.pdf"
+)
+draw_venn_pair(
+  a1 = nrow(subset(Diet_markers_eWAT_HFD12_vsCD12, Change=="down")),
+  a2 = nrow(subset(Diet_markers_eWAT_HFD18_vsCD18, Change=="down")),
+  cross = nrow(Epi_persist$down),
+  category = c("eWAT_12HFD_down","eWAT_18HFD_down"),
+  out_pdf = "VennDiagram_eWAT_down.pdf",
+  fill = c("#104680","#6DADD1")
+)
+
+## =========================
+## 15) Heatmaps (avg expression by Diet)
+## =========================
+plot_heatmap_by_diet <- function(obj, genes, out_pdf, w=4, h=10) {
+  obj_sub <- subset(obj, features = genes)
+  avg <- AverageExpression(obj_sub, features = genes, group.by = "Diet")
+  mat <- as.matrix(avg$RNA)
+  p <- pheatmap(
+    mat,
+    scale = "row",
+    color = colorRampPalette(c("#8B49F6","white","#EA3323"))(255),
+    show_rownames = TRUE, show_colnames = TRUE,
+    cluster_rows = FALSE, cluster_cols = FALSE,
+    fontsize_row = 12, fontsize_col = 10, angle_col = 45
+  )
+  pdf(out_pdf, width = w, height = h)
+  grid::grid.newpage(); grid::grid.draw(p$gtable)
+  dev.off()
+  invisible(p)
+}
+
+# iWAT up/down (Diet_Switch subset)
+Ing_ASPC_3cond <- subset(Ing_ASPC, subset = Diet %in% c("18-week-CD","18-week-HFD","Diet_Switch"))
+plot_heatmap_by_diet(Ing_ASPC_3cond, Ing_persist$up$gene,   "Heatmap_iWAT_up.pdf",   w=4, h=10)
+plot_heatmap_by_diet(Ing_ASPC_3cond, Ing_persist$down$gene, "Heatmap_iWAT_down.pdf", w=4, h=10)
+
+# eWAT up/down (Diet_Switch subset)
+Epi_ASPC_3cond <- subset(Epi_ASPC, subset = Diet %in% c("18-week-CD","18-week-HFD","Diet_Switch"))
+plot_heatmap_by_diet(Epi_ASPC_3cond, Epi_persist$up$gene,   "Heatmap_eWAT_up.pdf",   w=4, h=10)
+plot_heatmap_by_diet(Epi_ASPC_3cond, Epi_persist$down$gene, "Heatmap_eWAT_down.pdf", w=4, h=10)
+
+## =========================
+## 16) Percentage of expressing cells by Diet (NO 0/1 picking)
+## =========================
+calc_percent_expressing <- function(obj, genes, group_var="Diet", assay="RNA", slot="counts", out_csv="percent.csv") {
+  obj_sub <- subset(obj, features = genes)
+  counts <- GetAssayData(obj_sub, assay = assay, slot = slot)
+  groups <- unique(obj_sub[[group_var]][,1])
+  meta <- obj_sub[[group_var]][,1]
+  names(meta) <- colnames(obj_sub)
+  
+  percent_mat <- matrix(NA, nrow=nrow(counts), ncol=length(groups),
+                        dimnames=list(rownames(counts), groups))
+  for (g in groups) {
+    cells <- names(meta[meta == g])
+    expr_n <- rowSums(counts[, cells, drop=FALSE] > 0)
+    percent_mat[, g] <- expr_n / length(cells) * 100
+  }
+  df <- as.data.frame(percent_mat)
+  write.csv(df, out_csv, row.names = TRUE)
+  df
+}
+
+calc_percent_expressing(Ing_ASPC_3cond, Ing_persist$up$gene,   out_csv="iWAT_up_Percentage.csv")
+calc_percent_expressing(Ing_ASPC_3cond, Ing_persist$down$gene, out_csv="iWAT_down_Percentage.csv")
+calc_percent_expressing(Epi_ASPC_3cond, Epi_persist$up$gene,   out_csv="eWAT_up_Percentage.csv")
+calc_percent_expressing(Epi_ASPC_3cond, Epi_persist$down$gene, out_csv="eWAT_down_Percentage.csv")
+
+## =========================
+## 17) Gpc3 plots & summary tables (NO binning / NO selecting 0/1 groups)
+## =========================
+ggsave("FeaturePlot_Gpc3_split_iWAT.pdf",
+       FeaturePlot(Ing_ASPC_3cond, "Gpc3", cols=c("lightgrey","#BC3C29FF"), split.by="Diet", pt.size=1) + theme_umap_clean(),
+       width=10, height=3.5)
+
+ggsave("FeaturePlot_Gpc3_split_eWAT.pdf",
+       FeaturePlot(Epi_ASPC_3cond, "Gpc3", cols=c("lightgrey","#BC3C29FF"), split.by="Diet", pt.size=1) + theme_umap_clean(),
+       width=10, height=3.5)
+
+# Export raw (Diet, Gpc3) for violin/box etc.
+write.csv(FetchData(Epi_ASPC, vars=c("Diet","Gpc3")), "Epi_Gpc3_data.csv", row.names=FALSE)
+write.csv(FetchData(Ing_ASPC, vars=c("Diet","Gpc3")), "Ing_Gpc3_data.csv", row.names=FALSE)
+
+# “表达细胞比例”统计（不创建0/1标签，只做表）
+summarize_gene_expr_pct <- function(obj, gene="Gpc3", group_var="Diet", out_csv=NULL) {
+  total <- table(obj[[group_var]][,1])
+  dat <- FetchData(obj, vars=c(group_var, gene))
+  dat_expr <- dat[dat[[gene]] > 0, , drop=FALSE]
+  expr <- table(dat_expr[[group_var]])
+  pct <- (expr / total[names(expr)]) * 100
+  
+  res <- data.frame(
+    Group = names(total),
+    TotalCells = as.numeric(total),
+    ExprCells = as.numeric(expr[names(total)]),
+    Percentage = as.numeric(pct[names(total)])
+  )
+  res$ExprCells[is.na(res$ExprCells)] <- 0
+  res$Percentage[is.na(res$Percentage)] <- 0
+  
+  if (!is.null(out_csv)) write.csv(res, out_csv, row.names=FALSE)
+  res
+}
+
+print(summarize_gene_expr_pct(Ing_ASPC, "Gpc3", "Diet", out_csv="Ing_Gpc3_expr_percentage_byDiet.csv"))
+print(summarize_gene_expr_pct(Epi_ASPC, "Gpc3", "Diet", out_csv="Epi_Gpc3_expr_percentage_byDiet.csv"))
+
+## =============================================================================
+## PART D: (Optional) 2-subtype version (your 2025_new_figures block)
+## =============================================================================
+# If you already have this object saved, load it and proceed.
+# Otherwise skip this section.
+
+setwd("/Volumes/Leah_Projs/单细胞测序分析/scRNA_seq_SVF_cells/ASPC_recluster_1/2025_new_figures")
+
+# All_combined <- readRDS("New_ASPC_re0.04_rawclusters.rds")  # or your saved rds path
+# If you want exactly your mapping: 0,2 -> ASPC2 ; 1 -> ASPC1
+# (This is NOT Gpc3 thresholding; it's cluster relabel)
+# All_combined <- RenameIdents(All_combined, `0`="ASPC2", `1`="ASPC1", `2`="ASPC2")
+# All_combined$Subtype <- Idents(All_combined)
+# saveRDS(All_combined, "All_combined_2subtypes(after_anno).rds")
+
+#
