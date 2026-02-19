@@ -1,0 +1,436 @@
+# ==============================================================================
+# Gpc3 snRNA-seq pipeline (Control vs Mutant) 
+# Author: Yan Li
+# Contact: liyan@stu.pku.edu.cn
+# Lab: CarlosLab@PKU
+# ==============================================================================
+# How to run:
+# 1) Put data in:
+#    data/Control/filtered_feature_bc_matrix/
+#    data/Mutant/filtered_feature_bc_matrix/
+# 2) In R:
+#    source("run_gpc3_snRNAseq_pipeline_no_threshold.R")
+# Outputs:
+#    results/objects, results/figures, results/tables
+# ==============================================================================
+
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(Seurat)
+  library(harmony)
+  library(clustree)
+  library(patchwork)
+  library(pheatmap)
+  library(clusterProfiler)
+  library(org.Mm.eg.db)
+  library(enrichplot)
+  library(grid)
+  library(data.table)
+})
+
+# ---------------------------
+# 0) Parameters (edit here)
+# ---------------------------
+params <- list(
+  data_control = file.path("data", "Control", "filtered_feature_bc_matrix"),
+  data_mutant  = file.path("data", "Mutant",  "filtered_feature_bc_matrix"),
+  out_obj = file.path("results", "objects"),
+  out_fig = file.path("results", "figures"),
+  out_tbl = file.path("results", "tables"),
+  
+  qc = list(min_features = 200, max_features = 6000, max_mt = 10),
+  
+  merge_cluster_resolution = 0.1,
+  merge_harmony_dims = 1:30,
+  
+  aspc_stage1_dims = 1:13,
+  aspc_stage1_res  = 0.04,
+  aspc_stage2_dims = 1:9,
+  aspc_stage2_res  = 0.06,
+  
+  adipo_stage1_dims = 1:17,
+  adipo_stage1_res  = 0.02,
+  adipo_stage2_dims = 1:14,
+  adipo_stage2_res  = 0.1,
+  
+  go_showCategory = 5,
+  go_p_cut = 0.05,
+  de_min_pct = 0.05
+)
+
+dir.create("results", showWarnings = FALSE)
+dir.create(params$out_obj, recursive = TRUE, showWarnings = FALSE)
+dir.create(params$out_fig, recursive = TRUE, showWarnings = FALSE)
+dir.create(params$out_tbl, recursive = TRUE, showWarnings = FALSE)
+
+# ---------------------------
+# 1) Utility functions
+# ---------------------------
+assert_true <- function(cond, msg) if (!isTRUE(cond)) stop(msg)
+
+save_pheatmap_pdf <- function(pheatmap_obj, filename, width=8, height=8) {
+  pdf(filename, width = width, height = height)
+  grid.newpage()
+  grid.draw(pheatmap_obj$gtable)
+  dev.off()
+}
+
+load_one_sample <- function(path, group_name) {
+  assert_true(dir.exists(path), paste0("Data path not found: ", path))
+  mat <- Read10X(path)
+  obj <- CreateSeuratObject(mat, min.cells = 3)
+  obj$Group <- group_name
+  obj[["percent.mt"]] <- PercentageFeatureSet(obj, pattern = "^mt-")
+  obj
+}
+
+qc_filter <- function(obj, qc) {
+  subset(obj, subset = nFeature_RNA > qc$min_features &
+           nFeature_RNA < qc$max_features &
+           percent.mt < qc$max_mt)
+}
+
+basic_preprocess_harmony <- function(obj, group_var="Group") {
+  obj <- NormalizeData(obj) %>% FindVariableFeatures() %>% ScaleData() %>% RunPCA()
+  obj <- RunHarmony(obj, group.by.vars = group_var)
+  obj
+}
+
+run_umap_cluster <- function(obj, dims, reduction="harmony", resolution=0.1, algorithm=1) {
+  obj <- RunUMAP(obj, reduction = reduction, dims = dims)
+  obj <- FindNeighbors(obj, reduction = reduction, dims = dims)
+  obj <- FindClusters(obj, resolution = resolution, algorithm = algorithm)
+  obj
+}
+
+featureplot_clean <- function(obj, gene, title, order=TRUE, pt.size=1,
+                              cols=c("lightgrey","#921C12")) {
+  FeaturePlot(obj, features = gene,
+              cols = cols,
+              keep.scale = "feature",
+              pt.size = pt.size,
+              order = order) +
+    ggtitle(title) +
+    labs(x="", y="") +
+    theme(axis.text = element_blank(),
+          axis.ticks = element_blank(),
+          axis.line  = element_blank())
+}
+
+pieplot_proportion <- function(df_count, colors, title) {
+  df <- df_count %>%
+    group_by(Group) %>%
+    mutate(Percent = Count / sum(Count) * 100)
+  
+  ggplot(df, aes(x="", y=Percent, fill=Subtype)) +
+    geom_col(width=1, color="white") +
+    coord_polar(theta="y") +
+    facet_wrap(~Group) +
+    scale_fill_manual(values = colors) +
+    theme_void() +
+    ggtitle(title) +
+    theme(plot.title = element_text(hjust=0.5, size=16, face="bold"),
+          strip.text = element_text(size=14, face="bold"),
+          legend.title = element_text(size=13),
+          legend.text  = element_text(size=12))
+}
+
+run_DE_GO_one_subset <- function(obj, subset_label, out_dir, orgdb=org.Mm.eg.db,
+                                 min.pct=0.05, p_cut=0.05, showCategory=5) {
+  dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+  
+  Idents(obj) <- obj$Group
+  assert_true(all(c("Control","Mutant") %in% unique(obj$Group)), paste0(subset_label, ": need Control & Mutant"))
+  
+  de <- FindMarkers(
+    obj, ident.1="Mutant", ident.2="Control",
+    test.use="wilcox", logfc.threshold=0, min.pct=min.pct
+  ) %>%
+    as.data.frame() %>%
+    rownames_to_column("gene") %>%
+    arrange(desc(avg_log2FC))
+  
+  write.csv(de, file.path(out_dir, paste0(subset_label, "_DE_Mutant_vs_Control.csv")), row.names=FALSE)
+  
+  mutant_up  <- de %>% filter(avg_log2FC > 0, p_val < p_cut) %>% pull(gene)
+  control_up <- de %>% filter(avg_log2FC < 0, p_val < p_cut) %>% pull(gene)
+  
+  mut_entrez <- bitr(mutant_up,  fromType="SYMBOL", toType="ENTREZID", OrgDb=orgdb) %>% pull(ENTREZID)
+  ctl_entrez <- bitr(control_up, fromType="SYMBOL", toType="ENTREZID", OrgDb=orgdb) %>% pull(ENTREZID)
+  
+  ego_mut <- enrichGO(mut_entrez, OrgDb=orgdb, keyType="ENTREZID", ont="BP",
+                      pvalueCutoff=p_cut, qvalueCutoff=p_cut, pAdjustMethod="BH", readable=TRUE)
+  ego_ctl <- enrichGO(ctl_entrez, OrgDb=orgdb, keyType="ENTREZID", ont="BP",
+                      pvalueCutoff=p_cut, qvalueCutoff=p_cut, pAdjustMethod="BH", readable=TRUE)
+  
+  write.csv(as.data.frame(ego_mut), file.path(out_dir, paste0(subset_label, "_Mutant_GO_BP.csv")), row.names=FALSE)
+  write.csv(as.data.frame(ego_ctl), file.path(out_dir, paste0(subset_label, "_Control_GO_BP.csv")), row.names=FALSE)
+  
+  p_mut <- dotplot(ego_mut, showCategory=showCategory) +
+    ggtitle(paste0(subset_label, " Mutant-enriched GO BP")) +
+    theme(plot.title = element_text(hjust=0.5))
+  p_ctl <- dotplot(ego_ctl, showCategory=showCategory) +
+    ggtitle(paste0(subset_label, " Control-enriched GO BP")) +
+    theme(plot.title = element_text(hjust=0.5))
+  
+  ggsave(file.path(out_dir, paste0(subset_label, "_Mutant_GO_dotplot.pdf")), p_mut, width=10, height=3)
+  ggsave(file.path(out_dir, paste0(subset_label, "_Control_GO_dotplot.pdf")), p_ctl, width=10, height=3)
+  
+  invisible(list(DE=de, GO_mut=ego_mut, GO_ctl=ego_ctl))
+}
+
+# ---------------------------
+# 2) Load + QC + Merge
+# ---------------------------
+message("Loading data...")
+Control <- load_one_sample(params$data_control, "Control")
+Mutant  <- load_one_sample(params$data_mutant,  "Mutant")
+
+message("QC filtering...")
+Control_qc <- qc_filter(Control, params$qc)
+Mutant_qc  <- qc_filter(Mutant,  params$qc)
+
+saveRDS(Control_qc, file.path(params$out_obj, "Control_after_QC.rds"))
+saveRDS(Mutant_qc,  file.path(params$out_obj, "Mutant_after_QC.rds"))
+
+Merge <- merge(Control_qc, Mutant_qc)
+saveRDS(Merge, file.path(params$out_obj, "Merge_raw_after_QC.rds"))
+
+# QC plots
+p_qc_ctrl <- VlnPlot(Control, features=c("nFeature_RNA","nCount_RNA","percent.mt"), ncol=3)
+p_qc_mut  <- VlnPlot(Mutant,  features=c("nFeature_RNA","nCount_RNA","percent.mt"), ncol=3)
+ggsave(file.path(params$out_fig, "QC_Control_violin.pdf"), p_qc_ctrl, width=10, height=4)
+ggsave(file.path(params$out_fig, "QC_Mutant_violin.pdf"),  p_qc_mut,  width=10, height=4)
+
+# ---------------------------
+# 3) Normalize + Harmony + UMAP + clustering
+# ---------------------------
+message("Harmony integration + clustering...")
+Merge <- basic_preprocess_harmony(Merge, group_var="Group")
+Merge <- run_umap_cluster(Merge, dims=params$merge_harmony_dims, reduction="harmony",
+                          resolution=params$merge_cluster_resolution)
+
+saveRDS(Merge, file.path(params$out_obj, "Merge_clustered.rds"))
+
+# clustree (resolution scan)
+Merge.test <- Merge
+Merge.test <- FindClusters(Merge.test, resolution = seq(0, 0.5, 0.05), algorithm=1)
+p_tree <- clustree(Merge.test@meta.data, prefix = "RNA_snn_res.")
+ggsave(file.path(params$out_fig, "Merge_Clustree.pdf"), p_tree, width=8, height=8)
+
+# basic UMAP
+p_umap_raw <- DimPlot(Merge, reduction="umap", label=TRUE) + NoLegend()
+ggsave(file.path(params$out_fig, "Merge_UMAP_clusters.pdf"), p_umap_raw, width=8.5, height=8)
+
+# ---------------------------
+# 4) Marker export (clusters)
+# ---------------------------
+message("FindAllMarkers (clusters)...")
+DefaultAssay(Merge) <- "RNA"
+if ("JoinLayers" %in% ls("package:Seurat")) {
+  Merge <- JoinLayers(Merge, assay = "RNA")
+}
+
+Cluster_markers <- FindAllMarkers(Merge, only.pos=TRUE, assay="RNA", min.pct=0.25, logfc.threshold=0.25) %>%
+  as.data.table()
+setorderv(Cluster_markers, c("cluster","avg_log2FC","pct.1","pct.2"), c(1,-1,1,-1))
+fwrite(Cluster_markers, file.path(params$out_tbl, "Merge_clusters_markers.csv"))
+
+# ---------------------------
+# 5) Manual annotation (your mapping)
+# ---------------------------
+message("Manual annotation...")
+Merge <- RenameIdents(Merge,
+                      `0` = "Adipocyte", `1` = "Macrophage", `2` = "ASPC", `3` = "T cell",
+                      `4` = "Endothelial", `5` = "B cell", `6` = "T cell",
+                      `7` = "Dendritic", `8` = "Lymphoid stromal", `9` = "Lymphatic endo",
+                      `10` = "Pericyte", `11` = "Neutrophil", `12` = "B cell", `13` = "Myocyte"
+)
+Merge$Cell_Type <- Idents(Merge)
+
+celltypeRanks <- c("Adipocyte","ASPC","Endothelial","Lymphatic endo","Lymphoid stromal","Pericyte","Myocyte",
+                   "Macrophage","T cell","B cell","Dendritic","Neutrophil")
+cellcolorRanks <- c("#0072B5FF","#206864","#81475C","#7876B1FF","#995D7F","#008845B2","#91D1C2FF",
+                    "#D12920","#C35C6A","#CD7372","#C6A268","#ED6D3D")
+Idents(Merge) <- factor(Idents(Merge), levels = celltypeRanks)
+
+saveRDS(Merge, file.path(params$out_obj, "Merge_after_annotation.rds"))
+
+p_umap_type <- DimPlot(Merge, reduction="umap", pt.size=0.5, cols=cellcolorRanks,
+                       label=TRUE, repel=TRUE, label.size=7, label.color="black") +
+  NoLegend() + theme_void()
+ggsave(file.path(params$out_fig, "UMAP_all_cell_types.pdf"), p_umap_type, width=8.5, height=8)
+
+p_umap_type_split <- DimPlot(Merge, reduction="umap", pt.size=0.5, cols=cellcolorRanks, split.by="Group",
+                             label=TRUE, repel=TRUE, label.size=7, label.color="black") +
+  NoLegend() + theme_void()
+ggsave(file.path(params$out_fig, "UMAP_all_cell_types_split.pdf"), p_umap_type_split, width=16, height=8)
+
+# ---------------------------
+# 6) FeaturePlot for Gpc3 (NO threshold/min.cutoff; NO proportion stats)
+# ---------------------------
+message("Gpc3 FeaturePlots (no threshold)...")
+Control_only <- subset(Merge, subset = Group == "Control")
+Mutant_only  <- subset(Merge, subset = Group == "Mutant")
+
+p1 <- featureplot_clean(Control_only, "Gpc3", "Gpc3 in all Control cell types", order=TRUE,  pt.size=1)
+p2 <- featureplot_clean(Mutant_only,  "Gpc3", "Gpc3 in all Mutant cell types",  order=FALSE, pt.size=1)
+ggsave(file.path(params$out_fig, "Gpc3_Control_all_celltypes.pdf"), p1, width=8.5, height=8)
+ggsave(file.path(params$out_fig, "Gpc3_Mutant_all_celltypes.pdf"),  p2, width=8.5, height=8)
+
+# ---------------------------
+# 7) Marker heatmap for celltype markers (AverageExpression)
+# ---------------------------
+message("Celltype marker heatmap...")
+celltypeGene <- c("Adipoq","Pdgfra","Vwf","Prox1","Ccl19","Rgs5","Myot","Mafb","Cd3d","Ms4a1","Flt3","Csf3r")
+
+avg <- AverageExpression(Merge, group.by="Cell_Type")$RNA
+avg <- avg[celltypeGene, celltypeRanks, drop=FALSE]
+
+pal <- colorRampPalette(c("blue","white","red"))(255)
+p_ht <- pheatmap(avg, border_color="white", scale="row",
+                 cluster_rows=FALSE, cluster_cols=FALSE,
+                 show_rownames=TRUE, show_colnames=TRUE,
+                 color=pal, angle_col=45, fontsize=12, fontsize_row=12)
+save_pheatmap_pdf(p_ht, file.path(params$out_fig, "Celltype_marker_heatmap.pdf"), width=8.5, height=8)
+
+# ---------------------------
+# 8) ASPC subclustering -> ASPC1/ASPC2
+# ---------------------------
+message("ASPC subclustering...")
+ASPC <- subset(Merge, idents="ASPC")
+saveRDS(ASPC, file.path(params$out_obj, "ASPC_parent.rds"))
+
+ASPC <- basic_preprocess_harmony(ASPC, group_var="Group")
+ASPC <- run_umap_cluster(ASPC, dims=params$aspc_stage1_dims, reduction="harmony", resolution=params$aspc_stage1_res)
+saveRDS(ASPC, file.path(params$out_obj, "ASPC_stage1.rds"))
+
+# stage1 clustree
+ASPC.test <- ASPC
+ASPC.test <- FindClusters(ASPC.test, resolution=seq(0,0.2,0.02), algorithm=1)
+p_tree_aspc <- clustree(ASPC.test@meta.data, prefix="RNA_snn_res.")
+ggsave(file.path(params$out_fig, "ASPC_stage1_Clustree.pdf"), p_tree_aspc, width=8, height=10)
+
+# stage2: only clusters 0/1
+New_ASPC <- subset(ASPC, idents=c("0","1"))
+New_ASPC <- basic_preprocess_harmony(New_ASPC, group_var="Group")
+New_ASPC <- run_umap_cluster(New_ASPC, dims=params$aspc_stage2_dims, reduction="harmony", resolution=params$aspc_stage2_res)
+
+# stage2 clustree
+New_ASPC.test <- New_ASPC
+New_ASPC.test <- FindClusters(New_ASPC.test, resolution=seq(0,0.2,0.02), algorithm=1)
+p_tree_new_aspc <- clustree(New_ASPC.test@meta.data, prefix="RNA_snn_res.")
+ggsave(file.path(params$out_fig, "ASPC_stage2_Clustree.pdf"), p_tree_new_aspc, width=8, height=10)
+
+# rename: (1=ASPC1, 0=ASPC2)
+New_ASPC <- RenameIdents(New_ASPC, `1`="ASPC1", `0`="ASPC2")
+New_ASPC$Subtype <- Idents(New_ASPC)
+saveRDS(New_ASPC, file.path(params$out_obj, "ASPC_subtypes_ASPC1_ASPC2.rds"))
+
+Subtype_colors_ASPC <- c("#84A729","#2A6E3F")
+p_aspc <- DimPlot(New_ASPC, reduction="umap", pt.size=2, cols=Subtype_colors_ASPC, label=FALSE) +
+  theme(plot.title = element_blank(), panel.border = element_rect(colour="black", fill=NA, size=1)) +
+  theme_void()
+ggsave(file.path(params$out_fig, "ASPC_subtype.pdf"), p_aspc, width=8, height=7)
+
+p_aspc_split <- DimPlot(New_ASPC, reduction="umap", split.by="Group", pt.size=2, cols=Subtype_colors_ASPC, label=FALSE) +
+  theme(plot.title = element_blank(), panel.border = element_rect(colour="black", fill=NA, size=1)) +
+  theme_void()
+ggsave(file.path(params$out_fig, "ASPC_subtype_split.pdf"), p_aspc_split, width=14, height=7)
+
+# ASPC subtype pie plot
+tab_aspc <- table(New_ASPC$Group, New_ASPC$Subtype)
+df_aspc_count <- as.data.frame(tab_aspc) %>% setNames(c("Group","Subtype","Count"))
+p_pie_aspc <- pieplot_proportion(df_aspc_count, colors=c("ASPC1"="#88B04B","ASPC2"="#2E7D32"),
+                                 title="Proportion of ASPC Subtypes in Control and Mutant")
+ggsave(file.path(params$out_fig, "ASPC_Subtype_Proportion_PiePlot.pdf"), p_pie_aspc, width=10, height=6)
+
+# Gpc3 FeaturePlots in ASPC (NO threshold/min.cutoff)
+Control_ASPC <- subset(New_ASPC, subset = Group=="Control")
+Mutant_ASPC  <- subset(New_ASPC, subset = Group=="Mutant")
+p_aspc_g1 <- featureplot_clean(Control_ASPC, "Gpc3", "Gpc3 in all Control ASPCs", order=TRUE,  pt.size=1)
+p_aspc_g2 <- featureplot_clean(Mutant_ASPC,  "Gpc3", "Gpc3 in all Mutant ASPCs",  order=FALSE, pt.size=1)
+ggsave(file.path(params$out_fig, "Gpc3_Control_ASPC.pdf"), p_aspc_g1, width=4.5, height=4)
+ggsave(file.path(params$out_fig, "Gpc3_Mutant_ASPC.pdf"),  p_aspc_g2, width=4.5, height=4)
+
+# ASPC marker FeaturePlots
+p_dpp4 <- FeaturePlot(New_ASPC, "Dpp4", cols=c("lightgrey","#84A729"), pt.size=2, order=TRUE) + theme_void()
+p_pdgrb<- FeaturePlot(New_ASPC, "Pdgfrb", cols=c("lightgrey","#2A6E3F"), pt.size=2, order=TRUE) + theme_void()
+ggsave(file.path(params$out_fig, "FeaturePlot_Dpp4.pdf"), p_dpp4, width=6.5, height=6)
+ggsave(file.path(params$out_fig, "FeaturePlot_Pdgfrb.pdf"), p_pdgrb, width=6.5, height=6)
+
+# ---------------------------
+# 9) Adipocyte subclustering -> Adipocyte1/2/3
+# ---------------------------
+message("Adipocyte subclustering...")
+Adipocyte <- subset(Merge, idents="Adipocyte")
+saveRDS(Adipocyte, file.path(params$out_obj, "Adipocyte_parent.rds"))
+
+Adipocyte <- basic_preprocess_harmony(Adipocyte, group_var="Group")
+Adipocyte <- run_umap_cluster(Adipocyte, dims=params$adipo_stage1_dims, reduction="harmony", resolution=params$adipo_stage1_res)
+saveRDS(Adipocyte, file.path(params$out_obj, "Adipocyte_stage1.rds"))
+
+Adipocyte.test <- Adipocyte
+Adipocyte.test <- FindClusters(Adipocyte.test, resolution=seq(0,0.2,0.02), algorithm=1)
+p_tree_ad <- clustree(Adipocyte.test@meta.data, prefix="RNA_snn_res.")
+ggsave(file.path(params$out_fig, "Adipocyte_stage1_Clustree.pdf"), p_tree_ad, width=8, height=10)
+
+# take cluster 0 and subcluster
+New_Adipocyte <- subset(Adipocyte, idents="0")
+New_Adipocyte <- basic_preprocess_harmony(New_Adipocyte, group_var="Group")
+New_Adipocyte <- run_umap_cluster(New_Adipocyte, dims=params$adipo_stage2_dims, reduction="harmony", resolution=params$adipo_stage2_res)
+
+New_Adipocyte.test <- New_Adipocyte
+New_Adipocyte.test <- FindClusters(New_Adipocyte.test, resolution=seq(0,0.2,0.02), algorithm=1)
+p_tree_new_ad <- clustree(New_Adipocyte.test@meta.data, prefix="RNA_snn_res.")
+ggsave(file.path(params$out_fig, "Adipocyte_stage2_Clustree.pdf"), p_tree_new_ad, width=8, height=10)
+
+New_Adipocyte <- RenameIdents(New_Adipocyte, `0`="Adipocyte1", `1`="Adipocyte2", `2`="Adipocyte3")
+New_Adipocyte$Subtype <- Idents(New_Adipocyte)
+saveRDS(New_Adipocyte, file.path(params$out_obj, "Adipocyte_subtypes_1_2_3.rds"))
+
+Subtype_colors_Ad <- c("#5976BA","#2E59A7","#98B6C2")
+p_ad <- DimPlot(New_Adipocyte, reduction="umap", pt.size=2, cols=Subtype_colors_Ad, label=FALSE) +
+  theme_void() + theme(panel.border = element_rect(colour="black", fill=NA, size=1))
+ggsave(file.path(params$out_fig, "Adipocyte_subtype.pdf"), p_ad, width=8.5, height=7)
+
+p_ad_split <- DimPlot(New_Adipocyte, reduction="umap", split.by="Group", pt.size=2, cols=Subtype_colors_Ad, label=FALSE) +
+  theme_void() + theme(panel.border = element_rect(colour="black", fill=NA, size=1))
+ggsave(file.path(params$out_fig, "Adipocyte_subtype_split.pdf"), p_ad_split, width=14, height=7)
+
+# Adipocyte subtype pie plot
+tab_ad <- table(New_Adipocyte$Group, New_Adipocyte$Subtype)
+df_ad_count <- as.data.frame(tab_ad) %>% setNames(c("Group","Subtype","Count"))
+p_pie_ad <- pieplot_proportion(df_ad_count,
+                               colors=c("Adipocyte1"="#5976BA","Adipocyte2"="#2E59A7","Adipocyte3"="#98B6C2"),
+                               title="Proportion of Adipocyte Subtypes in Control and Mutant")
+ggsave(file.path(params$out_fig, "Adipocyte_Subtype_Proportion_PiePlot.pdf"), p_pie_ad, width=10, height=6)
+
+# Gpc3 FeaturePlots in Adipocyte (NO threshold/min.cutoff)
+Control_Ad <- subset(New_Adipocyte, subset = Group=="Control")
+Mutant_Ad  <- subset(New_Adipocyte, subset = Group=="Mutant")
+p_ad_g1 <- featureplot_clean(Control_Ad, "Gpc3", "Gpc3 in all Control Adipocytes", order=TRUE,  pt.size=1)
+p_ad_g2 <- featureplot_clean(Mutant_Ad,  "Gpc3", "Gpc3 in all Mutant Adipocytes",  order=FALSE, pt.size=1)
+ggsave(file.path(params$out_fig, "Gpc3_Control_Adipocyte.pdf"), p_ad_g1, width=4.5, height=4)
+ggsave(file.path(params$out_fig, "Gpc3_Mutant_Adipocyte.pdf"),  p_ad_g2, width=4.5, height=4)
+
+# ---------------------------
+# 10) DE + GO for ASPC1 and ASPC2 (Mutant vs Control)
+# ---------------------------
+message("DE + GO for ASPC1/ASPC2...")
+out_go <- file.path(params$out_tbl, "ASPC_DE_GO")
+dir.create(out_go, recursive = TRUE, showWarnings = FALSE)
+
+ASPC1 <- subset(New_ASPC, subset = Subtype=="ASPC1" & Group %in% c("Control","Mutant"))
+ASPC2 <- subset(New_ASPC, subset = Subtype=="ASPC2" & Group %in% c("Control","Mutant"))
+
+run_DE_GO_one_subset(ASPC1, "ASPC1", out_go, orgdb=org.Mm.eg.db,
+                     min.pct=params$de_min_pct, p_cut=params$go_p_cut, showCategory=params$go_showCategory)
+run_DE_GO_one_subset(ASPC2, "ASPC2", out_go, orgdb=org.Mm.eg.db,
+                     min.pct=params$de_min_pct, p_cut=params$go_p_cut, showCategory=params$go_showCategory)
+
+# ---------------------------
+# 11) Save session info
+# ---------------------------
+writeLines(capture.output(sessionInfo()), file.path(params$out_tbl, "sessionInfo.txt"))
+message("Pipeline finished. Check: results/")
